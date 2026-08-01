@@ -1,0 +1,219 @@
+---
+title: 中间件监控
+description: 数据库、缓存、消息队列、RPC 框架等中间件的健康状态监控
+---
+
+## 系统定位
+
+中间件监控系统覆盖应用依赖的核心基础设施——**数据库、缓存、消息队列、RPC 框架**。多数应用层故障的根因最终都落在这一层：DB 连接池耗尽、Redis 内存满、MQ 消费积压、RPC 线程池饱和。
+
+### 核心能力
+
+- **数据库**：连接池状态、慢查询 Top-K、锁等待、主从延迟
+- **缓存**：命中率、内存使用、慢命令、Key 驱逐
+- **消息队列**：消费延迟、积压量、Broker 状态
+- **RPC 框架**：线程池状态、超时率、熔断器状态
+
+---
+
+## MCP 工具接口
+
+### `mw_get_db_status` — 数据库状态
+
+```typescript
+mw_get_db_status(params: {
+  time_range: TimeRange;
+  scope: { db_instance: string } | { service: string };  // 按 DB 实例名或使用方服务名查询
+}) → DetailResponse<DBStatus>
+
+interface DBStatus {
+  instance: string;             // MySQL 实例名
+  type: 'mysql' | 'postgresql';
+
+  // 连接池（应用侧视角）
+  pool?: {
+    active: number;
+    max: number;
+    pending: number;
+    idle: number;
+    timeout_count_per_min: number;
+    is_exhausted: boolean;      // 主动标注：是否接近耗尽
+  };
+
+  // 数据库服务侧指标
+  db_server: {
+    qps: number;
+    tps: number;
+    avg_latency_ms: number;
+    p99_latency_ms: number;
+    connections_active: number;
+    connections_max: number;
+  };
+
+  // 慢查询
+  slow_queries: {
+    sql_template: string;       // 参数化后的 SQL 模板
+    count: number;
+    avg_duration_ms: number;
+    max_duration_ms: number;
+    rows_examined_avg: number;
+    is_full_scan: boolean;      // 主动标注：是否为全表扫描
+    index_used?: string;
+  }[];
+
+  // 锁信息
+  locks?: {
+    waiting_count: number;      // 等待中的锁数量
+    blocked_count: number;      // 被阻塞的事务
+    top_wait_queries: {         // 等待最久的查询
+      sql_template: string;
+      wait_duration_ms: number;
+    }[];
+  };
+
+  // 主从复制
+  replication?: {
+    is_replicating: boolean;
+    lag_seconds: number;        // 主从延迟
+    is_lag_abnormal: boolean;
+  };
+}
+```
+
+### `mw_get_cache_stats` — 缓存状态
+
+```typescript
+mw_get_cache_stats(params: {
+  time_range: TimeRange;
+  scope: { cache_instance: string } | { service: string };
+}) → DetailResponse<CacheStats>
+
+interface CacheStats {
+  instance: string;
+  type: 'redis' | 'memcached';
+
+  performance: {
+    hit_rate_pct: number;       // 命中率
+    avg_latency_ms: number;
+    p99_latency_ms: number;
+    ops_per_sec: number;
+  };
+
+  memory: {
+    used_mb: number;
+    max_mb: number;
+    used_pct: number;
+    evicted_keys_per_min: number;  // 驱逐速率 — 高值表示内存不足
+    is_near_limit: boolean;
+  };
+
+  connections: {
+    active: number;
+    max: number;
+    is_exhausted: boolean;
+  };
+
+  slow_commands: {              // 慢命令 Top 5
+    command: string;
+    count: number;
+    avg_duration_ms: number;
+  }[];
+}
+```
+
+### `mw_get_mq_stats` — 消息队列状态
+
+```typescript
+mw_get_mq_stats(params: {
+  time_range: TimeRange;
+  scope: { mq_instance: string } | { topic: string } | { consumer_group: string };
+}) → DetailResponse<MQStats>
+
+interface MQStats {
+  instance: string;
+  type: 'kafka' | 'rocketmq' | 'rabbitmq';
+
+  topics: {
+    name: string;
+    produce_rate_per_sec: number;
+    consume_rate_per_sec: number;
+    lag: number;                // 积压量
+    lag_trend: 'increasing' | 'decreasing' | 'stable';
+    is_lag_abnormal: boolean;
+  }[];
+
+  brokers: {
+    id: string;
+    host: string;
+    cpu_pct: number;
+    memory_pct: number;
+    disk_usage_pct: number;
+    network_rx_mbps: number;
+    network_tx_mbps: number;
+    is_healthy: boolean;
+  }[];
+}
+```
+
+### `mw_get_rpc_status` — RPC 框架状态
+
+```typescript
+mw_get_rpc_status(params: {
+  time_range: TimeRange;
+  scope: { service: string };
+}) → DetailResponse<RPCStatus>
+
+interface RPCStatus {
+  service: string;
+  framework: 'dubbo' | 'grpc' | 'thrift';
+
+  threadpool: {
+    name: string;               // 如 "DubboServerHandler-20880"
+    core_size: number;
+    max_size: number;
+    active_threads: number;
+    queue_size: number;
+    queue_remaining: number;
+    is_saturated: boolean;      // 主动标注：线程池是否饱和
+    rejected_count_per_min: number;
+  }[];
+
+  timeout: {
+    avg_timeout_rate_pct: number;
+    top_timeout_methods: {
+      method: string;
+      timeout_count: number;
+      timeout_rate_pct: number;
+      avg_duration_ms: number;
+    }[];
+  };
+
+  circuit_breaker: {
+    total_circuits: number;
+    open_circuits: number;      // 已打开的熔断器
+    open_circuit_details?: {
+      method: string;
+      opened_at: string;
+      failure_rate_pct: number;
+    }[];
+  };
+}
+```
+
+---
+
+## Agent 消费模型
+
+```
+RT 飙升场景 — 定位到 mysql span 后:
+  Step 1: mw_get_db_status(service="order-service")
+    → 连接池 198/200，标注 is_exhausted=true
+    → 慢查询 Top 1: SELECT * FROM orders... 全表扫描
+  Step 2: 结合 trace_compare_baseline 验证
+    → mysql span: 5ms → 3100ms，与慢查询时间吻合
+
+服务报错突增 — 怀疑 RPC 线程池:
+  Step 1: mw_get_rpc_status(service="order-service")
+    → Dubbo 线程池 saturated=true，rejected=32/min
+    → 结合 log_aggregate 看到 "Thread pool exhausted"
+```

@@ -1,0 +1,225 @@
+---
+title: 知识经验库
+description: 故障病例沉淀、检索与持续优化的经验闭环系统
+---
+
+## 系统定位
+
+知识经验库是 TraceHound **"越来越聪明"的核心引擎**。它将每次诊断的结果沉淀为结构化病例，在后续类似故障时自动检索匹配，让 Agent 带着历史经验进入新的诊断任务。
+
+### 核心能力
+
+- 诊断结果自动沉淀为结构化病例
+- 按告警特征检索相似历史病例
+- 支持人工反馈纠偏（诊断对了/错了/漏了什么）
+- 高频验证过的模式可升级为 Skill 内置规则
+
+---
+
+## 病例数据模型
+
+```typescript
+interface CaseRecord {
+  case_id: string;              // 唯一病例 ID
+  created_at: string;           // 创建时间
+  updated_at: string;
+
+  // 告警特征 — 用于检索匹配
+  alert_signature: {
+    service: string;            // 发生故障的服务
+    cluster?: string;
+    alert_metric: string;       // 如 "p99_latency"、"cpu_usage"
+    alert_rule?: string;        // 触发告警的规则
+    severity: 'P0' | 'P1' | 'P2';
+    time_pattern?: string;      // 如 "工作日 14:00-16:00"
+    duration_minutes: number;
+    symptom_summary: string;    // 症状一句话描述
+  };
+
+  // 诊断结论
+  diagnosis: {
+    root_cause: string;         // 根因一句话描述
+    root_cause_category: string;// 根因分类: 'code_bug' | 'config_change' | 'capacity' | 'dependency' | 'infrastructure' | 'unknown'
+    root_cause_service: string; // 根因所在的服务/组件
+    confidence: number;         // Agent 诊断置信度 0-1
+    causal_chain: {             // 因果链
+      step: number;
+      description: string;
+      evidence_refs: string[];  // 引用 evidence 中的条目
+    }[];
+  };
+
+  // 证据快照
+  evidence: {
+    source: string;             // 数据来源: 'trace' | 'log' | 'host' | 'mw' | 'change'
+    tool_call: string;          // 调用的 MCP 工具
+    key_finding: string;        // 关键发现
+    data_snapshot: Record<string, unknown>;  // 数据快照
+  }[];
+
+  // 处理结果
+  resolution: {
+    action_taken: string;       // 采取的操作
+    action_type: 'rollback' | 'scale' | 'config_change' | 'restart' | 'manual_fix' | 'no_action';
+    time_to_resolve_minutes: number;
+    permanent_fix?: string;     // 永久修复方案
+    related_ticket?: string;    // 关联工单
+  };
+
+  // 反馈
+  feedback: {
+    diagnosis_correct: boolean;
+    reviewer?: string;
+    review_notes?: string;      // SRE 的反馈笔记
+    missed_causes?: string[];   // Agent 遗漏的原因
+    rating?: 1 | 2 | 3 | 4 | 5; // 1-5 评分
+    reviewed_at?: string;
+  };
+
+  // 标签 — 用于多维检索
+  tags: string[];
+}
+```
+
+---
+
+## MCP 工具接口
+
+### `case_search` — 搜索相似病例
+
+根据当前告警特征，检索历史相似病例。
+
+```typescript
+case_search(params: {
+  alert_signature: {
+    service: string;
+    alert_metric: string;
+    severity?: string;
+  };
+  symptom_keywords?: string[];   // 症状关键词
+  time_range?: TimeRange;        // 可选：只看某时间段的病例
+  min_similarity?: number;       // 最低相似度 0-1, 默认 0.5
+  top?: number;                  // 默认 5
+}) → ListResponse<CaseMatch>
+
+interface CaseMatch {
+  case_id: string;
+  similarity_score: number;      // 0-1 相似度
+  match_reason: string;          // 为什么匹配："同一服务、同一告警指标、相似时间模式"
+
+  alert_signature: CaseRecord['alert_signature'];
+  diagnosis: {
+    root_cause: string;
+    confidence: number;
+  };
+  resolution: {
+    action_taken: string;
+    time_to_resolve_minutes: number;
+    permanent_fix?: string;
+  };
+  feedback?: {
+    diagnosis_correct: boolean;
+    rating?: number;
+  };
+
+  created_at: string;
+}
+```
+
+### `case_get_detail` — 获取病例详情
+
+```typescript
+case_get_detail(params: {
+  case_id: string;
+}) → DetailResponse<CaseRecord>
+```
+
+### `case_save` — 保存新病例
+
+诊断 Agent 完成诊断后，自动调用此接口保存病例。
+
+```typescript
+case_save(params: {
+  case: Omit<CaseRecord, 'case_id' | 'created_at' | 'updated_at' | 'feedback'>;
+}) → DetailResponse<{ case_id: string }>
+```
+
+### `case_feedback` — 提交反馈
+
+SRE 对诊断结果进行评价和纠偏。
+
+```typescript
+case_feedback(params: {
+  case_id: string;
+  feedback: CaseRecord['feedback'];
+}) → DetailResponse<{ updated: boolean }>
+```
+
+---
+
+## 经验闭环流程
+
+```
+                    ┌──────────────────┐
+                    │   告警触发        │
+                    └────────┬─────────┘
+                             │
+                    ┌────────▼─────────┐
+                    │  case_search()   │  ← 检索相似病例
+                    │  相似度 > 0.7?    │
+                    └───┬────────┬─────┘
+                        │ YES    │ NO
+              ┌─────────▼──┐ ┌──▼──────────┐
+              │ 复用历史    │ │ 冷启动诊断   │
+              │ 诊断路径    │ │ Agent 全流程 │
+              └─────┬──────┘ └──┬──────────┘
+                    │            │
+                    └─────┬──────┘
+                          │
+                 ┌────────▼─────────┐
+                 │  case_save()     │  ← 自动沉淀
+                 └────────┬─────────┘
+                          │
+                 ┌────────▼─────────┐
+                 │  case_feedback() │  ← SRE 反馈
+                 └────────┬─────────┘
+                          │
+            ┌─────────────┼─────────────┐
+            │             │             │
+      ┌─────▼──────┐ ┌───▼────┐ ┌─────▼──────┐
+      │ 更新匹配权重 │ │ 发现   │ │ 高验证率    │
+      │             │ │ 新模式  │ │ → 升级 Skill│
+      └─────────────┘ └────────┘ └────────────┘
+```
+
+---
+
+## 检索策略
+
+### 多层级匹配
+
+| 层级 | 匹配方式 | 权重 | 说明 |
+|------|---------|------|------|
+| 精确匹配 | 同服务 + 同告警指标 + 同时间模式 | 最高 | 几乎肯定是相同问题 |
+| 语义匹配 | 不同服务但症状描述相似 | 中 | 问题模式可跨服务复用 |
+| 因果链匹配 | 故障传播路径相似 | 中 | 如"QPS↑→慢查询→连接池满"模式 |
+| 标签匹配 | 共享故障分类标签 | 低 | 广泛参考 |
+
+### Agent 如何使用检索结果
+
+```
+Phase 1: 接收告警 → case_search(alert_signature)
+  → 匹配到 2 个相似病例，相似度 0.85 和 0.62
+
+Phase 2: 高相似度病例 → 直接提示 Agent
+  "2 周前 order-service 出现类似 RT 飙升，根因是 DB 连接池耗尽（因慢查询未释放连接）。
+   当时的修复是：扩容连接池 + kill 慢查询线程。置信度 85%。"
+
+Phase 3: Agent 优先验证历史根因路径
+  → 调 mw_get_db_status → 确认连接池确实满了
+  → 省去大量探索性排查时间
+
+Phase 4: 诊断完成 → case_save()
+  → 如果是新根因 → 丰富病例库
+  → 如果和历史一致 → 强化该模式的权重
+```

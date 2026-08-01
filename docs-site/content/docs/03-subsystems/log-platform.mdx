@@ -1,0 +1,108 @@
+---
+title: 日志平台
+description: 应用日志检索与聚合分析系统 — MCP 接口定义
+---
+
+## 系统定位
+
+日志平台为诊断 Agent 提供**应用日志的结构化检索与智能聚合能力**。在海量日志中，Agent 需要的不是原始日志流，而是**经过聚类、采样、模式提取后的信号**。
+
+### 核心能力
+
+- 按服务、时间范围、关键字搜索日志
+- 按错误 pattern 自动聚类，发现高频报错
+- 提取错误堆栈并去重
+- 支持与 TraceID 关联查询
+
+---
+
+## MCP 工具接口
+
+### `log_search` — 日志搜索
+
+```typescript
+log_search(params: {
+  time_range: TimeRange;
+  scope: { service: string; host?: string; instance?: string };
+  filters?: {
+    level?: 'ERROR' | 'WARN' | 'INFO' | 'DEBUG';
+    keyword?: string;
+    trace_id?: string;
+  };
+  pagination?: PaginationParams;
+}) → ListResponse<LogEntry>
+
+interface LogEntry {
+  timestamp: string;
+  level: string;
+  service: string;
+  host: string;
+  message: string;              // 日志原文（已脱敏）
+  trace_id?: string;
+  stack_trace?: string;         // 异常堆栈（如有）
+}
+```
+
+### `log_aggregate` — 日志模式聚合
+
+按 error pattern 自动聚类，返回高频报错分组。**这是诊断 Agent 最常用的接口**——先看聚合，再按需下钻原文。
+
+```typescript
+log_aggregate(params: {
+  time_range: TimeRange;
+  scope: { service: string; host?: string };
+  group_by: 'pattern' | 'error_type' | 'service';
+  top?: number;                 // 默认 10
+}) → ListResponse<LogPattern>
+
+interface LogPattern {
+  pattern: string;              // 聚合后的模式，如 "Connection to {host}:{port} refused"
+  count: number;                // 出现次数
+  first_seen: string;           // 首次出现时间
+  last_seen: string;            // 最后出现时间
+  trend: 'rising' | 'falling' | 'stable';  // 趋势
+  sample_entries: LogEntry[];   // 3-5 条采样原文
+  error_type?: string;          // 如 ConnectionError, TimeoutError, NullPointer
+  is_new_pattern?: boolean;     // 是否为新的报错模式（之前未见过）
+}
+```
+
+### `log_get_error_stack` — 获取错误堆栈
+
+获取某条日志关联的完整异常堆栈。
+
+```typescript
+log_get_error_stack(params: {
+  log_entry_id: string;
+}) → DetailResponse<ErrorStackDetail>
+
+interface ErrorStackDetail {
+  log_entry: LogEntry;
+  stack_frames: {
+    class_name: string;
+    method_name: string;
+    file_name?: string;
+    line_number?: number;
+    is_project_code: boolean;   // 是否为项目代码（非第三方库）
+  }[];
+  // 去重聚合：相同堆栈在时间窗口内出现了多少次
+  occurrence_count: number;
+  occurrence_trend: 'rising' | 'falling' | 'stable';
+}
+```
+
+---
+
+## Agent 消费模型
+
+```
+Step 1: log_aggregate(service, time_range, group_by='pattern')
+  → 拿到 Top 10 高频报错模式
+  → 发现 "Connection pool exhausted" 出现 487 次
+
+Step 2: log_search(filter: { keyword: "Connection pool" })
+  → 拉取少量原文确认上下文
+
+Step 3 (可选): log_get_error_stack()
+  → 查看完整堆栈，确认是哪个连接池、哪行代码
+```

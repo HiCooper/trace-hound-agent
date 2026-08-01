@@ -1,0 +1,10 @@
+{
+  "title": "TraceHound",
+  "pages": [
+    "index",
+    "01-architecture",
+    "02-mcp-framework",
+    "03-subsystems",
+    "04-scenarios"
+  ]
+}

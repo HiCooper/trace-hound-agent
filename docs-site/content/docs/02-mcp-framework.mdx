@@ -1,0 +1,220 @@
+---
+title: 统一 MCP 接口规范
+description: 六大子系统的 MCP 工具接口统一框架、命名规范、参数约定与响应结构
+---
+
+## 设计目标
+
+六个子系统需要在统一的接口框架下暴露 MCP 工具。这样做有几个目的：
+
+- **降低 Agent 学习成本** — 一致的命名和参数风格，Agent 不需要记住 6 套不同的 API 规范
+- **人机共用** — 同一个 MCP 工具既被 Agent 调用，也能被诊断面板直接调用展示数据
+- **可扩展** — 新增子系统（如"DNS 监控"）只需按框架实现接口即可接入
+
+---
+
+## 通用约定
+
+### 命名规范
+
+```
+{domain}_{action}
+
+domain: 子系统标识
+  trace   — 调用链追踪
+  log     — 日志平台
+  host    — 主机 & 进程监控
+  mw      — 中间件监控
+  change  — 变更管控平台
+  case    — 知识经验库
+
+action: 操作语义
+  search        — 搜索/查询列表
+  get_detail    — 获取单个实体详情
+  get_summary   — 获取聚合摘要
+  compare       — 对比分析（当前 vs 基线）
+  get_topology  — 获取拓扑/关系
+  get_recent    — 获取最近记录
+```
+
+### 通用参数约定
+
+```typescript
+// 所有接口共享的基础参数
+interface BaseParams {
+  // 时间范围 — 所有查询必须指定
+  time_range: {
+    start: string;   // ISO 8601, 如 "2026-07-31T14:00:00+08:00"
+    end: string;     // ISO 8601
+  };
+
+  // 目标范围 — 按需至少指定一项
+  scope?: {
+    service?: string;     // 服务名
+    cluster?: string;     // 集群
+    host?: string;        // 主机 IP 或 hostname
+    instance?: string;    // 实例 ID (pod/container)
+  };
+}
+
+// 分页参数 — 列表类接口统一使用
+interface PaginationParams {
+  page?: number;      // 从 1 开始, 默认 1
+  page_size?: number; // 默认 20, 最大 100
+}
+
+// 排序参数
+interface SortParams {
+  sort_by?: string;   // 排序字段
+  sort_order?: 'asc' | 'desc'; // 默认 desc
+}
+```
+
+### 通用响应结构
+
+```typescript
+// 列表类响应
+interface ListResponse<T> {
+  items: T[];
+  total: number;
+  page: number;
+  page_size: number;
+
+  // 聚合摘要（可选，列表接口可附带聚合信息）
+  summary?: {
+    [key: string]: string | number;
+  };
+}
+
+// 详情类响应
+interface DetailResponse<T> {
+  data: T;
+
+  // 关联资源提示（Agent 可用于下钻）
+  related?: {
+    label: string;
+    tool_name: string;   // 下一步可调用的 MCP 工具
+    params: Record<string, unknown>;
+  }[];
+}
+
+// 对比类响应
+interface CompareResponse<T> {
+  current: T;
+  baseline: T;
+
+  deviations: {
+    field: string;
+    current_value: number;
+    baseline_value: number;
+    ratio: number;        // current / baseline
+    is_anomaly: boolean;
+    severity?: 'low' | 'medium' | 'high';
+  }[];
+}
+
+// 错误响应
+interface ErrorResponse {
+  error: {
+    code: string;         // 机器可读错误码
+    message: string;      // 人类可读错误描述
+    suggestion?: string;  // 建议的处理方式
+  };
+}
+```
+
+### 数据降级原则
+
+Agent 的上下文窗口有限，每个接口的返回数据应遵循：
+
+| 原则 | 说明 |
+|------|------|
+| **聚合优先** | 列表接口默认返回聚合结果，原文按需单独拉取 |
+| **Top-K 截断** | 列表类数据默认返回 Top 20，不分页返回全量 |
+| **关键字段优先** | 详情接口只返回诊断相关的核心字段，冗余字段裁剪 |
+| **标注分析结论** | 接口应预处理并标注异常值（`is_anomaly`），减轻 Agent 计算负担 |
+
+---
+
+## 接口总览
+
+### Trace Viewer — `trace_*`
+
+| 接口 | 说明 |
+|------|------|
+| `trace_search` | 搜索异常 Trace 摘要列表 |
+| `trace_get_detail` | 获取单条 Trace 的完整调用链树 |
+| `trace_compare_baseline` | 对比当前 Trace 与历史基线 |
+| `trace_get_span_detail` | 获取单个 Span 的详情（SQL、线程栈等） |
+| `trace_get_topology` | 获取服务调用拓扑 |
+
+### 日志平台 — `log_*`
+
+| 接口 | 说明 |
+|------|------|
+| `log_search` | 按条件搜索日志 |
+| `log_aggregate` | 按 pattern 聚合日志（聚类） |
+| `log_get_error_stack` | 获取错误/异常关联的堆栈 |
+
+### 主机 & 进程监控 — `host_*`
+
+| 接口 | 说明 |
+|------|------|
+| `host_get_metrics` | 获取主机基础指标（CPU/内存/磁盘/网络） |
+| `host_get_process_list` | 获取进程列表（按资源排序） |
+| `host_get_process_detail` | 获取单个进程详情（线程、FD、GC 等） |
+| `host_compare_cluster` | 集群内多台机器指标对比 |
+
+### 中间件监控 — `mw_*`
+
+| 接口 | 说明 |
+|------|------|
+| `mw_get_db_status` | 数据库连接池/慢查询/锁状态 |
+| `mw_get_cache_stats` | Redis 命中率/内存/慢命令 |
+| `mw_get_mq_stats` | 消息队列积压/消费延迟 |
+| `mw_get_rpc_status` | RPC 框架线程池/超时/熔断 |
+
+### 变更管控平台 — `change_*`
+
+| 接口 | 说明 |
+|------|------|
+| `change_get_recent` | 查询近期变更记录 |
+| `change_get_detail` | 获取单条变更详情 |
+| `change_check_lockdown` | 查询封网状态 |
+
+### 知识经验库 — `case_*`
+
+| 接口 | 说明 |
+|------|------|
+| `case_search` | 按告警特征搜索相似历史病例 |
+| `case_get_detail` | 获取单个病例详情 |
+| `case_save` | 保存诊断结果为新病例 |
+| `case_feedback` | 提交病例反馈（纠偏/补充） |
+
+---
+
+## 接口分层消费模型
+
+Agent 在不同诊断阶段消费不同粒度的数据：
+
+```
+Phase 1: 宏观定位
+  → trace_search, log_aggregate, host_get_metrics
+  → 返回聚合/摘要数据，不返回原文
+  → Agent 拿到"问题大概在哪里"的线索
+
+Phase 2: 定向深挖
+  → trace_get_detail, log_search, host_get_process_detail
+  → 返回单个实体的详细信息
+  → Agent 验证假设 + 排除干扰
+
+Phase 3: 对比验证
+  → trace_compare_baseline, host_compare_cluster
+  → 返回"当前 vs 正常"的偏差分析
+  → Agent 确认根因 + 计算置信度
+
+Phase 4: 知识检索
+  → case_search
+  → 返回相似历史病例
+  → Agent 结合历史经验输出最终结论
+```

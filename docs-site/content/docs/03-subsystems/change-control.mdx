@@ -1,0 +1,173 @@
+---
+title: 变更管控平台
+description: 应用变更记录、配置变更、封网管控的统一查询平台
+---
+
+## 系统定位
+
+变更管控平台是企业 IT 变更的统一记录与管控系统。它覆盖应用的**代码部署、配置变更、基础设施变更**，并管理**封网期**（禁止变更窗口）。对故障诊断而言，变更记录是排查的"第一问"——**绝大多数生产故障都与近期的某次变更相关。**
+
+### 核心能力
+
+- 代码部署记录：版本、时间、操作人、变更内容
+- 配置变更记录：配置项、变更前后值
+- 基础设施变更：扩缩容、网络策略、DNS
+- 封网管控：封网日历、封网期变更限制
+
+---
+
+## MCP 工具接口
+
+### `change_get_recent` — 查询近期变更
+
+```typescript
+change_get_recent(params: {
+  time_range: TimeRange;       // 默认：告警前 1 小时到告警时间
+  scope: {
+    service?: string;          // 支持按服务筛选
+    cluster?: string;
+    host?: string;
+  };
+  filters?: {
+    change_type?: 'deploy' | 'config' | 'infrastructure' | 'all';
+    status?: 'success' | 'failed' | 'rolling_back' | 'all';
+  };
+  pagination?: PaginationParams;
+}) → ListResponse<ChangeRecord>
+
+interface ChangeRecord {
+  change_id: string;
+  change_type: 'deploy' | 'config' | 'infrastructure';
+  target_service: string;      // 影响的服务/系统
+  target_hosts?: string[];     // 影响的主机列表
+
+  // 部署类型
+  deploy?: {
+    artifact: string;          // 制品名
+    old_version: string;
+    new_version: string;
+    commit_hash?: string;
+    commit_message?: string;
+    diff_summary?: string;     // 变更摘要（如 "修改订单查询逻辑"）
+  };
+
+  // 配置类型
+  config?: {
+    config_key: string;
+    old_value: string;
+    new_value: string;
+    config_file?: string;
+  };
+
+  // 基础设施类型
+  infrastructure?: {
+    resource_type: string;     // 如 "ECS"、"SLB"、"DNS"
+    operation: string;         // 如 "scale_out"、"modify_rule"
+    detail: string;
+  };
+
+  operator: string;            // 操作人
+  start_time: string;
+  end_time?: string;
+  status: 'pending' | 'running' | 'success' | 'failed' | 'rolling_back' | 'rolled_back';
+  approval_ticket?: string;    // 审批单号
+}
+```
+
+### `change_get_detail` — 变更详情
+
+```typescript
+change_get_detail(params: {
+  change_id: string;
+}) → DetailResponse<ChangeDetail>
+
+interface ChangeDetail {
+  change_id: string;
+  change_type: 'deploy' | 'config' | 'infrastructure';
+  target_service: string;
+
+  // 完整的变更 diff
+  full_diff?: string;          // 代码 diff 或配置 diff
+
+  // 变更执行过程
+  execution_log?: {
+    timestamp: string;
+    step: string;
+    status: string;
+    message?: string;
+  }[];
+
+  // 关联的监控告警（变更后是否触发过告警）
+  related_alerts?: {
+    alert_id: string;
+    alert_name: string;
+    trigger_time: string;
+    severity: string;
+  }[];
+
+  operator: string;
+  reviewers?: string[];        // 审批人
+  start_time: string;
+  end_time: string;
+  status: string;
+}
+```
+
+### `change_check_lockdown` — 查封网状态
+
+```typescript
+change_check_lockdown(params: {
+  time_range: TimeRange;
+  scope?: { service?: string; cluster?: string };
+}) → DetailResponse<LockdownStatus>
+
+interface LockdownStatus {
+  is_lockdown: boolean;
+  lockdown_name?: string;      // 如 "双11封网"
+  lockdown_period?: {
+    start: string;
+    end: string;
+  };
+  affected_services?: string[];
+  exception_allowed?: boolean; // 是否允许申请例外变更
+  exception_process?: string;  // 例外审批流程说明
+
+  // 封网期的变更如有，标记风险
+  changes_during_lockdown?: {
+    change_id: string;
+    is_exception_approved: boolean;
+    risk_level: 'high' | 'medium';
+  }[];
+}
+```
+
+---
+
+## Agent 消费模型
+
+变更管控是几乎所有故障场景的**优先检查项**：
+
+```
+Step 1: change_get_recent(service="order-service", time_range: [告警前1h, 告警时])
+  → 14:00 order-service v2.7.3 部署
+  → 操作人: zhangsan
+  → diff_summary: "修改订单查询 SQL 条件"
+
+Step 2 (可选): change_get_detail(change_id)
+  → 查看完整 diff
+  → 确认 SQL 条件变更是否可能导致慢查询/全表扫描
+
+Step 3 (可选): change_check_lockdown()
+  → 确认当前是否封网期
+  → 如果是，标记风险等级
+```
+
+### 诊断决策树中的优先级
+
+```
+告警触发
+  ├── 是否有近期部署？ → 是 → 高概率是变更引入
+  │   └── 对比 diff → SQL 条件变更 → 可能导致全表扫描 → 根因定位
+  ├── 是否封网期？ → 是 → 确认变更是否走例外审批
+  └── 无变更记录 → 排除变更因素 → 转向中间件/基础设施排查
+```

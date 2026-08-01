@@ -1,0 +1,162 @@
+---
+title: 案例：服务 RT 飙升诊断
+description: 以 order-service RT 飙升为例，展示 Agent 如何组合 6 个子系统完成诊断
+---
+
+## 场景描述
+
+- **告警时间**: 2026-07-31 14:08:22
+- **告警服务**: order-service (prod-sh-02 集群)
+- **告警指标**: HTTP 接口 p99 延迟从 50ms 飙升至 3,200ms (+6300%)
+- **严重级别**: P1
+
+---
+
+## Agent 诊断全流程
+
+### Step 1: 获取上下文 — 是否有近期变更？
+
+```
+Agent 调用:
+  → change_get_recent(service="order-service", time_range=[13:08, 14:08])
+
+返回:
+  ● 14:00 · order-service v2.7.3 部署 (zhangsan)
+    diff_summary: "优化订单列表查询，放宽时间范围筛选条件"
+  ● 09:15 · 促销活动上线
+
+Agent 判断:
+  变更与告警时间高度吻合（部署后 8 分钟出现异常）。
+  标记为高嫌疑，但需要更多证据确认因果关系。
+```
+
+### Step 2: 宏观定位 — 搜索异常 Trace
+
+```
+Agent 调用:
+  → trace_search(service="order-service", {min_duration_ms: 1000})
+
+返回:
+  Top 20 异常 Trace，全部 bottleneck_span 指向:
+    mysql-order-db · SQL SELECT * FROM orders
+    平均耗时 3,100ms，占请求总耗时 96.8%
+
+Agent 判断:
+  瓶颈高度集中在一个 Span 上（不是分布式多跳问题）。
+  下一步：与基线对比，确认偏差程度。
+```
+
+### Step 3: 对比验证 — 基线偏差分析
+
+```
+Agent 调用:
+  → trace_compare_baseline(trace_id, baseline="last_5min_normal")
+
+返回:
+  Deviations:
+    - mysql-order-db span: 5ms → 3,100ms (+620x) ⚠ HIGH
+    - redis-cache span: 2ms → 2ms (0x) ✓
+    - user-service span: 12ms → 14ms (+1.16x) ✓
+  
+  Primary suspect: mysql-order-db span
+  Overall verdict: ANOMALOUS
+
+Agent 判断:
+  只有 mysql 调用异常，redis 和 user-service 完全正常。
+  问题确定在数据库层面，不是网络或应用自身。
+```
+
+### Step 4: 定向深挖 — 数据库状态诊断
+
+```
+Agent 调用:
+  → mw_get_db_status(service="order-service")
+
+返回:
+  pool:
+    active: 198 / 200, pending: 47
+    is_exhausted: true
+    timeout_count_per_min: 32
+
+  slow_queries[0]:
+    sql_template: "SELECT * FROM orders WHERE user_id=? AND status=?"
+    count: 487, avg_duration_ms: 3200
+    rows_examined_avg: 2,300,000
+    is_full_scan: true   ← 全表扫描！
+    index_used: null
+
+Agent 判断:
+  ● 连接池接近耗尽（198/200）
+  ● 慢查询是全表扫描——最可能原因是索引失效
+  ● 变更记录显示 "优化订单列表查询，放宽时间范围筛选条件"
+  → 很可能是 SQL 条件变更导致优化器放弃了索引
+```
+
+### Step 5: 交叉验证 — 日志确认
+
+```
+Agent 调用:
+  → log_aggregate(service="order-service", group_by="pattern")
+
+返回:
+  Top 1: "Connection pool exhausted" · 487 次 · trend: rising
+  Top 2: "Timeout waiting for connection" · 32 次
+
+Agent 判断:
+  日志与数据库监控数据一致——连接池耗尽导致大量等待超时。
+  证据链闭合。
+```
+
+### Step 6: 历史案例匹配
+
+```
+Agent 调用:
+  → case_search(alert_signature={service:"order-service", metric:"p99_latency"})
+
+返回:
+  ● [相似度 0.82] 2 周前 · order-service RT 飙升
+    根因: 索引因统计信息过期失效，导致全表扫描
+    修复: ANALYZE TABLE orders + 添加 force index 提示
+    时间: 12min 解决
+
+Agent 判断:
+  高相似度病例，且根因路径与当前证据完全吻合。
+  建议复现历史修复方案。
+```
+
+---
+
+## 最终诊断输出
+
+### 因果链
+
+```
+QPS +20%（促销活动）
+  → 新部署代码放宽了 SQL 时间筛选条件
+  → MySQL 优化器选择全表扫描（索引失效）
+  → 单次查询从 5ms 飙升至 3.2s
+  → 慢查询长期占用连接
+  → 连接池逐步耗尽 (198/200, 47 pending)
+  → 新请求排队等待连接
+  → p99 延迟飙升触发告警
+```
+
+### 置信度与证据
+
+| 证据 | 来源 | 结论 |
+|------|------|------|
+| 14:00 有代码部署，SQL 条件变更 | 变更管控平台 | 高嫌疑 |
+| mysql span 耗时 +620x | Trace Viewer | 瓶颈确认 |
+| 慢查询 487 次，全表扫描 | 中间件监控 | 根因确定 |
+| 连接池 198/200，接近耗尽 | 中间件监控 | 因果链中段 |
+| "Connection pool exhausted" 487 次 | 日志平台 | 交叉验证 |
+| 历史相同病例 | 知识经验库 | 修复方案参考 |
+
+**综合置信度：90%**
+
+### 建议操作
+
+1. **立即**: 扩容连接池 200→400 (止损)
+2. **立即**: Kill 当前慢查询线程 (止损)
+3. **短期**: 验证 orders 表索引，添加 force index 或优化 SQL 条件
+4. **长期**: 添加慢查询 + 连接池监控告警，避免被动发现

@@ -1,0 +1,11 @@
+{
+  "title": "数据子系统",
+  "pages": [
+    "trace-viewer",
+    "log-platform",
+    "host-monitor",
+    "middleware-monitor",
+    "change-control",
+    "knowledge-base"
+  ]
+}

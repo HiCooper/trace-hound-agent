@@ -1,0 +1,210 @@
+---
+title: 主机 & 进程监控
+description: 应用服务器与容器的基础资源监控 — CPU、内存、磁盘、网络、JVM、进程详情
+---
+
+## 系统定位
+
+主机 & 进程监控系统提供**应用服务器和容器的底层资源监控数据**。它是 CPU 飙高、内存泄漏、磁盘 IO 饱和、网络异常等场景的核心数据源。
+
+### 核心能力
+
+- 主机级基础指标：CPU、内存、磁盘 IO、网络流量、Load
+- 进程级详情：进程列表、线程详情、FD 数量、上下文切换
+- JVM 级诊断：堆内存、GC 统计、线程 Dump
+- 集群级对比：多台机器间指标差异分析
+
+---
+
+## MCP 工具接口
+
+### `host_get_metrics` — 主机基础指标
+
+```typescript
+host_get_metrics(params: {
+  time_range: TimeRange;
+  scope: { host: string } | { service: string; cluster?: string };
+}) → DetailResponse<HostMetrics>
+
+interface HostMetrics {
+  host: string;
+  cpu: {
+    usage_pct: number;          // CPU 使用率 (%)
+    load_1m: number;
+    load_5m: number;
+    load_15m: number;
+    breakdown: {                // CPU 时间分配
+      user_pct: number;
+      system_pct: number;
+      iowait_pct: number;       // IO 等待 — 高值可能表示磁盘瓶颈
+      steal_pct: number;        // 虚拟化 steal — 高值表示宿主机超卖
+    };
+  };
+  memory: {
+    total_gb: number;
+    used_gb: number;
+    used_pct: number;
+    swap_used_gb: number;
+  };
+  disk: {
+    device: string;
+    read_mbps: number;
+    write_mbps: number;
+    iops: number;
+    iowait_pct: number;
+    usage_pct: number;          // 磁盘使用率
+  }[];
+  network: {
+    interface: string;
+    rx_mbps: number;
+    tx_mbps: number;
+    tcp_retransmit_pct: number; // TCP 重传率
+    tcp_connections: number;
+  }[];
+}
+```
+
+### `host_get_process_list` — 进程列表
+
+获取主机上按指定维度排序的进程列表。
+
+```typescript
+host_get_process_list(params: {
+  time_range: TimeRange;
+  scope: { host: string };
+  sort_by?: 'cpu' | 'memory' | 'io';  // 默认 cpu
+  top?: number;                        // 默认 10
+}) → ListResponse<ProcessSummary>
+
+interface ProcessSummary {
+  pid: number;
+  name: string;
+  cmdline: string;
+  cpu_pct: number;
+  memory_pct: number;
+  memory_gb: number;
+  io_read_mbps: number;
+  io_write_mbps: number;
+  fd_count: number;
+  threads_count: number;
+  is_java: boolean;            // 是否为 JVM 进程
+}
+```
+
+### `host_get_process_detail` — 进程详情
+
+获取单个进程的详细诊断信息。
+
+```typescript
+host_get_process_detail(params: {
+  host: string;
+  pid: number;
+  include_thread_dump?: boolean;  // 是否包含线程 Dump
+}) → DetailResponse<ProcessDetail>
+
+interface ProcessDetail {
+  pid: number;
+  name: string;
+  cmdline: string;
+  start_time: string;
+  uptime_seconds: number;
+  cpu_pct: number;
+  memory_gb: number;
+  memory_pct: number;
+
+  // 线程信息
+  threads: {
+    total: number;
+    top_cpu_threads: {          // CPU 占用 Top 5 线程
+      tid: number;
+      name: string;
+      cpu_pct: number;
+      state: string;            // RUNNING / WAITING / BLOCKED
+    }[];
+  };
+
+  // JVM 信息（仅 Java 进程）
+  jvm?: {
+    heap_max_gb: number;
+    heap_used_gb: number;
+    heap_used_pct: number;
+    gc: {
+      collector: string;        // G1 / CMS / Parallel
+      young_gc_count: number;
+      young_gc_time_ms: number;
+      full_gc_count: number;
+      full_gc_time_ms: number;
+      is_abnormal: boolean;     // Full GC 频率是否异常
+    };
+    thread_dump?: string;       // 线程 Dump 原始文本
+    thread_dump_summary?: {     // 线程 Dump 摘要
+      total_threads: number;
+      blocked_threads: number;
+      waiting_threads: number;
+      runnable_threads: number;
+      deadlocked_threads: number;
+      top_stack_traces: {       // 出现最多的堆栈 Top 5
+        stack: string;
+        thread_count: number;
+        state: string;
+      }[];
+    };
+  };
+
+  // OOM 事件
+  oom_events?: {
+    timestamp: string;
+    type: 'OOM_KILLED' | 'JVM_OOM';
+    message: string;
+  }[];
+}
+```
+
+### `host_compare_cluster` — 集群内对比
+
+对比同一集群内多台机器的指标差异，用于定位"个别机器异常"场景。
+
+```typescript
+host_compare_cluster(params: {
+  time_range: TimeRange;
+  scope: { cluster: string; service?: string };
+  metric: 'cpu' | 'memory' | 'disk_io' | 'network_retransmit' | 'gc';
+}) → CompareResponse<ClusterComparison>
+
+interface ClusterComparison {
+  cluster: string;
+  hosts: {
+    host: string;
+    metric_value: number;
+    deviation_from_median_pct: number;  // 偏离集群中位数的百分比
+    is_outlier: boolean;
+    outlier_severity?: 'low' | 'medium' | 'high';
+  }[];
+  summary: {
+    host_count: number;
+    median_value: number;
+    outlier_count: number;
+  };
+}
+```
+
+---
+
+## Agent 消费模型
+
+```
+CPU 飙高场景:
+  Step 1: host_get_metrics(host)
+    → CPU 90%，但 iowait 低，排除磁盘问题
+  Step 2: host_get_process_list(host, sort_by='cpu', top=5)
+    → Java 进程 PID 12345 占用 75% CPU
+  Step 3: host_get_process_detail(host, pid=12345, include_thread_dump=true)
+    → 线程 TID 67890 占 60%，堆栈指向某个业务的 XML 解析循环
+    → GC 正常，排除 GC 导致的 CPU 飙高
+
+网络重传场景:
+  Step 1: host_compare_cluster(cluster, metric='network_retransmit')
+    → 发现 3 台机器重传率异常偏高
+  Step 2: host_get_metrics(anomalous_host)
+    → 查看网卡级别指标
+```
